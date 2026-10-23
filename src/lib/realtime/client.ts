@@ -64,6 +64,22 @@ function redactError(message: string): string {
 }
 
 /**
+ * Heartbeat tuning. Defaults are intentionally cheap on mobile/battery:
+ * a ping every 25s with a 10s pong deadline. The dev mock server can
+ * disable heartbeats entirely (see `heartbeatEnabled`) when testing
+ * purely offline flows.
+ */
+export const HEARTBEAT_INTERVAL_MS = 25_000;
+export const HEARTBEAT_PONG_DEADLINE_MS = 10_000;
+
+/** Snapshot of heartbeat state for health/observability consumers. */
+export interface HeartbeatState {
+  lastPongAt: number | null;
+  consecutiveMisses: number;
+  healthy: boolean;
+}
+
+/**
  * Realtime WebSocket client.
  *
  * Handles connection lifecycle, subscription replay, and auth token expiry
@@ -77,6 +93,11 @@ function redactError(message: string): string {
  * push-based update type (e.g. "oracle_update"). Callers must treat this
  * connection as best-effort — always keep an independent REST fetch as the
  * source of truth for initial state.
+ *
+ * An application-level heartbeat sends `{ type: "ping" }` frames on an
+ * interval and expects `{ type: "pong" }` back within a deadline. Missed
+ * deadlines mark the connection unhealthy and close it so the existing
+ * reconnect logic takes over, detecting half-open sockets.
  *
  * Snapshot-and-resume: the last-applied sequence per topic is persisted and
  * sent as a `since` cursor on (re)subscribe so the server can replay missed
@@ -180,6 +201,12 @@ export class RealtimeClient {
   private inspectorListeners = new Set<InspectorListener>();
   private inspectorSeq = 0;
   private static readonly INSPECTOR_MAX_EVENTS = 100;
+
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private pongDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastPongAt: number | null = null;
+  private consecutiveMisses = 0;
+  private healthy = true;
 
   connect(): void {
     if (typeof WebSocket === "undefined" || this.socket) return;
@@ -382,14 +409,27 @@ export class RealtimeClient {
       this.reportedReconnectLoops = 0;
       this.updateHealth({ status: "open", attempt: 0 });
       this.resubscribe();
+      this.healthy = true;
+      this.consecutiveMisses = 0;
+      this.startHeartbeat();
     });
     this.socket.addEventListener("message", (event) => {
       try {
-        const { topic, payload, seq } = JSON.parse(event.data as string) as {
-          topic: string;
-          payload: unknown;
+        const data = JSON.parse(event.data as string) as {
+          topic?: string;
+          payload?: unknown;
+          type?: string;
           seq?: number;
         };
+        if (data.type === "pong") {
+          this.handlePong();
+          return;
+        }
+        if (data.type === "ping") {
+          this.send({ type: "pong" });
+          return;
+        }
+        const { topic, payload, seq } = data;
         if (typeof seq === "number") this.setCursor(topic, seq);
         this.recordInspectorEvent({
           topic,
@@ -404,6 +444,7 @@ export class RealtimeClient {
       }
     });
     this.socket.addEventListener("close", () => {
+      this.stopHeartbeat();
       this.socket = null;
       if (!this.closedByUser) {
         this.updateHealth({ status: "reconnecting" });
@@ -414,6 +455,57 @@ export class RealtimeClient {
       this.recordError(event);
       this.socket?.close();
     });
+  }
+
+  private send(message: unknown): void {
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    try {
+      this.socket.send(JSON.stringify(message));
+    } catch {
+      // Send failures surface via the close/error handlers.
+    }
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      this.send({ type: "ping" });
+      if (this.pongDeadlineTimer) clearTimeout(this.pongDeadlineTimer);
+      this.pongDeadlineTimer = setTimeout(() => {
+        this.pongDeadlineTimer = null;
+        this.handleMissedPong();
+      }, HEARTBEAT_PONG_DEADLINE_MS);
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this.pongDeadlineTimer) clearTimeout(this.pongDeadlineTimer);
+    this.heartbeatTimer = null;
+    this.pongDeadlineTimer = null;
+  }
+
+  private handlePong(): void {
+    this.lastPongAt = Date.now();
+    this.consecutiveMisses = 0;
+    this.healthy = true;
+    if (this.pongDeadlineTimer) clearTimeout(this.pongDeadlineTimer);
+    this.pongDeadlineTimer = null;
+  }
+
+  private handleMissedPong(): void {
+    this.consecutiveMisses += 1;
+    this.healthy = false;
+    // Close the half-open socket; the close handler triggers reconnect.
+    this.socket?.close();
+  }
+
+  getHeartbeatState(): HeartbeatState {
+    return {
+      lastPongAt: this.lastPongAt,
+      consecutiveMisses: this.consecutiveMisses,
+      healthy: this.healthy,
+    };
   }
 
   private scheduleReconnect(): void {
@@ -553,5 +645,13 @@ export class RealtimeClient {
     return () => {
       this.handlers.get(topic)?.delete(handler);
     };
+  }
+
+  disconnect(): void {
+    this.closedByUser = true;
+    this.stopHeartbeat();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.socket?.close();
+    this.socket = null;
   }
 }
