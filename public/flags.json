@@ -1,6 +1,7 @@
 {
   "flags": {
     "realtime-oracle": false,
+    "horizon-stream": false,
     "realtime-quotes": false,
     "realtime-heartbeat": true,
     "realtime-heartbeat-interval-ms": 30000,

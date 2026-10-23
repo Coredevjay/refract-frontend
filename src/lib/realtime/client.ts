@@ -1,12 +1,24 @@
 import { API_BASE_URL } from "@/lib/api/client";
 import { getRealtimeCapability } from "@/lib/realtime/capabilities";
 
+import { startWakeDetector } from "./lifecycle";
 import { recordBytes, utf8Length } from "./metrics";
+import type { TopicMap } from "./topics";
 
 type Handler = (payload: unknown) => void;
 
+/** Lifecycle of the realtime connection, surfaced so the UI never silently shows stale data. */
+export type RealtimeStatus = "idle" | "connecting" | "live" | "resyncing" | "offline";
+
+/** A non-WebSocket source (e.g. Horizon SSE) that shares the client's lifecycle and health. */
+export interface StreamTransport {
+  start(): void;
+  stop(): void;
+}
+
 const MAX_BACKOFF_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
+const SEEN_IDS_CAP = 500;
 const CURSOR_STORAGE_PREFIX = "realtime:cursor:";
 const MAX_REPORTED_RECONNECT_LOOPS = 5;
 
@@ -92,9 +104,11 @@ export interface HeartbeatState {
  * The backend contract this assumes (documented, not yet implemented
  * upstream): connect to `${wsUrl}`, receive JSON messages shaped
  * `{ topic: string, payload: unknown, seq?: number }`, one topic per
- * push-based update type (e.g. "oracle_update"). Callers must treat this
- * connection as best-effort — always keep an independent REST fetch as the
- * source of truth for initial state.
+ * push-based update type (e.g. "oracle_update"). On every (re)connect the
+ * client sends one `{ type: "subscribe", topics, snapshot: true }` batch for
+ * all active topics. Callers must treat this connection as best-effort —
+ * always keep an independent REST fetch as the source of truth for initial
+ * state.
  *
  * An application-level heartbeat sends `{ type: "ping" }` frames on an
  * interval and expects `{ type: "pong" }` back within a deadline. Missed
@@ -172,10 +186,32 @@ export class RealtimeClient {
   private refreshInFlight: Promise<string | null> | null = null;
   private readonly authenticatedSubscriptions = new Map<string, AuthenticatedSubscription>();
   private handlers = new Map<string, Set<Handler>>();
-  private cursors = new Map<string, number>();
+  private transports = new Set<StreamTransport>();
+  private statusListeners = new Set<(s: RealtimeStatus) => void>();
+  private status: RealtimeStatus = "idle";
   private attempt = 0;
   private closedByUser = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopWake: (() => void) | null = null;
+  /** Bounded set of recent event ids so a post-resync snapshot replay is reconciled, not duplicated. */
+  private seenIds = new Set<string>();
+
+  getStatus(): RealtimeStatus {
+    return this.status;
+  }
+
+  onStatus(listener: (s: RealtimeStatus) => void): () => void {
+    this.statusListeners.add(listener);
+    return () => this.statusListeners.delete(listener);
+  }
+
+  private setStatus(next: RealtimeStatus): void {
+    if (this.status === next) return;
+    this.status = next;
+    this.statusListeners.forEach((l) => l(next));
+  }
+
+  private cursors = new Map<string, number>();
   private negotiated = false;
 
   constructor(options: RealtimeClientOptions) {
@@ -213,6 +249,7 @@ export class RealtimeClient {
   connect(): void {
     if (typeof WebSocket === "undefined" || this.socket) return;
     this.closedByUser = false;
+    this.stopWake ??= startWakeDetector(() => this.resync());
     if (this.negotiated) {
       this.open();
       return;
@@ -397,6 +434,20 @@ export class RealtimeClient {
 
   private open(): void {
     const wsUrl = API_BASE_URL.replace(/^http/, "ws").replace(/\/api\/v1$/, "/ws");
+    if (this.status !== "resyncing") this.setStatus("connecting");
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(wsUrl);
+    } catch {
+      this.setStatus("offline");
+      return;
+    }
+    this.socket = socket;
+  }
+  }
+
+  private open(): void {
+    const wsUrl = API_BASE_URL.replace(/^http/, "ws").replace(/\/api\/v1$/, "/ws");
     this.updateHealth({ status: this.attempt > 0 ? "reconnecting" : "connecting" });
     try {
       this.socket = new WebSocket(wsUrl);
@@ -405,8 +456,23 @@ export class RealtimeClient {
       this.scheduleReconnect();
       return;
     }
+    const socket = this.socket;
 
-    this.socket.addEventListener("open", () => {
+    socket.addEventListener("open", () => {
+      if (this.socket !== socket) return;
+      this.attempt = 0;
+      this.reportedReconnectLoops = 0;
+      this.updateHealth({ status: "open", attempt: 0 });
+      this.setStatus("live");
+      const topics = [...this.handlers.keys()];
+      if (topics.length > 0) socket.send(JSON.stringify({ type: "subscribe", topics, snapshot: true }));
+      this.scheduleReconnect();
+      return;
+    }
+    this.socket = socket;
+
+    socket.addEventListener("open", () => {
+      if (this.socket !== socket) return;
       this.attempt = 0;
       this.reportedReconnectLoops = 0;
       this.updateHealth({ status: "open", attempt: 0 });
@@ -414,8 +480,12 @@ export class RealtimeClient {
       this.healthy = true;
       this.consecutiveMisses = 0;
       this.startHeartbeat();
+      this.setStatus("live");
+      const topics = [...this.handlers.keys()];
+      if (topics.length > 0) socket.send(JSON.stringify({ type: "subscribe", topics, snapshot: true }));
     });
-    this.socket.addEventListener("message", (event) => {
+    socket.addEventListener("message", (event) => {
+      if (this.socket !== socket) return;
       try {
         const raw = event.data as string;
         const data = JSON.parse(raw) as {
@@ -441,6 +511,7 @@ export class RealtimeClient {
           payload,
         });
         recordBytes(topic, "in", utf8Length(raw));
+        if (this.isDuplicate(payload)) return;
         this.handlers.get(topic)?.forEach((handler) => handler(payload));
         this.markMessageReceived();
       } catch {
@@ -512,6 +583,15 @@ export class RealtimeClient {
     };
   }
 
+  private isDuplicate(payload: unknown): boolean {
+    const id = (payload as { id?: unknown } | null)?.id;
+    if (typeof id !== "string") return false;
+    if (this.seenIds.has(id)) return true;
+    this.seenIds.add(id);
+    if (this.seenIds.size > SEEN_IDS_CAP) this.seenIds.delete(this.seenIds.values().next().value as string);
+    return false;
+  }
+
   private scheduleReconnect(): void {
     if (this.reconnectTimer) return;
     const delay = Math.min(BASE_BACKOFF_MS * 2 ** this.attempt, MAX_BACKOFF_MS);
@@ -522,6 +602,35 @@ export class RealtimeClient {
       this.reconnectTimer = null;
       if (!this.closedByUser) this.open();
     }, delay);
+  }
+
+  /**
+   * Drops the (possibly dead) connection and reconnects once, immediately,
+   * resubscribing every active topic as a single batch with a snapshot
+   * request. Idempotent: it supersedes any pending backoff timer instead of
+   * adding a second reconnect.
+   */
+  resync(): void {
+    if (this.closedByUser || this.handlers.size === 0) return;
+    this.setStatus("resyncing");
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const stale = this.socket;
+    this.socket = null; // detaches stale listeners (they check identity)
+    stale?.close();
+    this.attempt = 0;
+    this.transports.forEach((t) => {
+      t.stop();
+      t.start();
+    });
+    this.open();
+  }
+
+  registerTransport(transport: StreamTransport): () => void {
+    this.transports.add(transport);
+    return () => this.transports.delete(transport);
   }
 
   private resubscribe(): void {
@@ -636,11 +745,17 @@ export class RealtimeClient {
     };
   }
 
+  subscribe<T extends keyof TopicMap>(topic: T, handler: (payload: TopicMap[T]) => void): () => void;
+  subscribe(topic: string, handler: Handler): () => void;
   subscribe(topic: string, handler: Handler): () => void {
-    if (!this.handlers.has(topic)) this.handlers.set(topic, new Set());
+    const isNew = !this.handlers.has(topic);
+    if (isNew) this.handlers.set(topic, new Set());
     this.handlers.get(topic)!.add(handler);
     this.loadCursor(topic);
     this.connect();
+    if (isNew && this.socket?.readyState === 1) {
+      this.socket.send(JSON.stringify({ type: "subscribe", topics: [topic], snapshot: true }));
+    }
 
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
       this.sendSubscribe(topic, this.cursors.get(topic));
@@ -655,7 +770,11 @@ export class RealtimeClient {
     this.closedByUser = true;
     this.stopHeartbeat();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.stopWake?.();
+    this.stopWake = null;
     this.socket?.close();
     this.socket = null;
+    this.setStatus("idle");
   }
 }
