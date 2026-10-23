@@ -11,6 +11,7 @@
     "realtime-heartbeat-interval-ms": 30000,
     "realtime-heartbeat-pong-deadline-ms": 10000,
     "realtime-shadow-mode": false,
+    "realtime-pool-stats": false,
     "realtime": {
       "topics": {
         "oracle_update": { "enabled": false },
