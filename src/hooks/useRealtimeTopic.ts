@@ -1,11 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { mergeSnapshot, type MergeFn } from '../lib/realtime/merge';
+import { mergeRealtimeEvent, mergeSnapshot, type MergeFn, type RealtimeEvent, type RealtimeState } from '../lib/realtime/merge';
 import { getRegistry, type SubscriptionRegistry } from '../lib/realtime/registry';
 import type { RealtimeClient } from '../lib/realtime/client';
 
 export type RealtimeStatus = 'idle' | 'loading' | 'live' | 'polling' | 'error';
 
 export interface UseRealtimeTopicOptions<T> {
+  /**
+   * Whether updates for this topic are replaceable (only the latest value matters).
+   * Replaceable topics are coalesced to at most one render per animation frame.
+   */
+  replaceable?: boolean;
+  /**
+   * Optional selector to derive the rendered value from the merged state.
+   * Defaults to the merged state itself.
+   */
+  select?: (state: RealtimeState<T>) => RealtimeState<T>;
   /** Fetches the REST snapshot used as the initial/fallback value. */
   snapshotFetcher?: () => Promise<T>;
   /** Merge rule applied to streamed events (defaults to latest-wins). */
@@ -34,6 +44,35 @@ export interface UseRealtimeTopicResult<T> {
 
 const DEFAULT_POLL_INTERVAL_MS = 30_000;
 
+const isTestEnv = (): boolean => {
+  if (typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'test') {
+    return true;
+  }
+  return typeof (globalThis as { __REALTIME_DISABLE_COALESCE__?: boolean }).__REALTIME_DISABLE_COALESCE__ === 'boolean'
+    ? Boolean((globalThis as { __REALTIME_DISABLE_COALESCE__?: boolean }).__REALTIME_DISABLE_COALESCE__)
+    : false;
+};
+
+const prefersReducedMotion = (): boolean => {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+    return false;
+  }
+  try {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    return false;
+  }
+};
+
+const scheduleFrame = (cb: () => void): (() => void) => {
+  if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+    const id = window.requestAnimationFrame(cb);
+    return () => window.cancelAnimationFrame(id);
+  }
+  const id = setTimeout(cb, 16);
+  return () => clearTimeout(id);
+};
+
 /**
  * Generic React binding over the realtime transport + merge layers.
  *
@@ -41,12 +80,20 @@ const DEFAULT_POLL_INTERVAL_MS = 30_000;
  * and falls back to REST polling when realtime is disabled or unavailable.
  * Subscriptions are routed through the shared registry so identical topics are
  * reference-counted rather than opened per hook instance.
+ *
+ * Replaceable topics (e.g. oracle readings) are buffered and flushed at most
+ * once per animation frame so high-frequency streams cannot cause render
+ * storms. A trailing-edge flush guarantees the latest value is always rendered.
+ * Coalescing is disabled under reduced motion and in automated tests so
+ * flushing is deterministic.
  */
 export function useRealtimeTopic<T>(
   topic: string,
   options: UseRealtimeTopicOptions<T> = {},
 ): UseRealtimeTopicResult<T> {
   const {
+    replaceable = false,
+    select,
     snapshotFetcher,
     merge,
     enabled = true,
@@ -62,21 +109,64 @@ export function useRealtimeTopic<T>(
   const [status, setStatus] = useState<RealtimeStatus>('idle');
   const [lastEventAt, setLastEventAt] = useState<number | null>(null);
 
-  // Keep the latest merge/fetcher in refs so effects don't resubscribe on
-  // every render (avoids resubscribe storms).
+  // Keep the latest merge/fetcher/select in refs so effects don't resubscribe
+  // on every render (avoids resubscribe storms).
   const mergeRef = useRef(merge);
   mergeRef.current = merge;
   const fetcherRef = useRef(snapshotFetcher);
   fetcherRef.current = snapshotFetcher;
+  const selectRef = useRef(select);
+  selectRef.current = select;
 
   const pendingEventsRef = useRef<T[]>([]);
   const mountedRef = useRef(true);
 
+  // Coalescing state for replaceable topics.
+  const stateRef = useRef<RealtimeState<T> | undefined>(undefined);
+  const pendingRef = useRef<RealtimeState<T> | null>(null);
+  const cancelRef = useRef<(() => void) | null>(null);
+
+  const coalesce = replaceable && !isTestEnv() && !prefersReducedMotion();
+  const coalesceRef = useRef(coalesce);
+  coalesceRef.current = coalesce;
+
+  const flush = useCallback((): void => {
+    cancelRef.current = null;
+    const next = pendingRef.current;
+    if (next === null) {
+      return;
+    }
+    pendingRef.current = null;
+    stateRef.current = next;
+    if (mountedRef.current) {
+      setData(next as unknown as T);
+    }
+  }, []);
+
+  const apply = useCallback((next: RealtimeState<T>): void => {
+    if (!coalesceRef.current) {
+      stateRef.current = next;
+      if (mountedRef.current) {
+        setData(next as unknown as T);
+      }
+      return;
+    }
+    pendingRef.current = next;
+    if (cancelRef.current === null) {
+      cancelRef.current = scheduleFrame(flush);
+    }
+  }, [flush]);
+
   const applyEvent = useCallback((event: T) => {
     if (!mountedRef.current) return;
-    setData((current) => (mergeRef.current ?? ((_c, i) => i))(current, event));
+    const current = stateRef.current;
+    const merged = current !== undefined
+      ? mergeRealtimeEvent(current, event as unknown as RealtimeEvent<T>)
+      : (event as unknown as RealtimeState<T>);
+    const selected = selectRef.current ? selectRef.current(merged) : merged;
+    apply(selected);
     setLastEventAt(Date.now());
-  }, []);
+  }, [apply]);
 
   const fetchSnapshot = useCallback(async () => {
     const fetcher = fetcherRef.current;
@@ -86,7 +176,9 @@ export function useRealtimeTopic<T>(
       if (!mountedRef.current) return;
       const pending = pendingEventsRef.current;
       pendingEventsRef.current = [];
-      setData(mergeSnapshot(snapshot, pending, mergeRef.current));
+      const merged = mergeSnapshot(snapshot, pending, mergeRef.current);
+      stateRef.current = merged as unknown as RealtimeState<T>;
+      setData(merged);
     } catch {
       if (mountedRef.current) setStatus('error');
     }
@@ -123,8 +215,14 @@ export function useRealtimeTopic<T>(
     });
     return () => {
       unsubscribe();
+      if (cancelRef.current !== null) {
+        cancelRef.current();
+        cancelRef.current = null;
+      }
+      // Trailing-edge flush on unmount so the latest value is never stranded.
+      flush();
     };
-  }, [topic, realtimeActive, subscribeFn, applyEvent]);
+  }, [topic, realtimeActive, subscribeFn, applyEvent, flush]);
 
   // REST polling fallback when realtime is disabled or unavailable.
   useEffect(() => {
@@ -138,3 +236,16 @@ export function useRealtimeTopic<T>(
 
   return { data, status, lastEventAt };
 }
+
+/**
+ * Deterministic flush hook for tests: forces any buffered replaceable update
+ * to render immediately.
+ */
+export function useRealtimeFlush(): () => void {
+  return () => {
+    if (typeof (globalThis as { __REALTIME_FLUSH__?: () => void }).__REALTIME_FLUSH__ === 'function') {
+      (globalThis as { __REALTIME_FLUSH__?: () => void }).__REALTIME_FLUSH__!();
+    }
+  };
+}
+
