@@ -1,3 +1,5 @@
+"use client";
+
 import { useEffect, useState } from "react";
 
 import {
@@ -32,4 +34,5 @@ export function useRealtimeHealth(): RealtimeHealthSnapshot {
     snapshot.lastMessageAt === null ? null : Date.now() - snapshot.lastMessageAt;
 
   return { ...snapshot, lastMessageAgeMs };
+}
 }

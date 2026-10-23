@@ -1,9 +1,54 @@
+import type { RealtimeClient } from './client';
 import {
   DEFAULT_REALTIME_LIMITS,
   InboundRateLimiter,
   RealtimeLimits,
   decideAdmission,
 } from './limits';
+
+/**
+ * Per-topic subscription registry with reference counting and lazy teardown.
+ *
+ * The registry is the single source of truth for which logical topics are
+ * active. Consumers call `subscribe(topic, handler)` and receive an
+ * unsubscribe function; the underlying transport subscription is opened on the
+ * first consumer and torn down only when the last consumer unsubscribes.
+ *
+ * Teardown ordering on route change: React unmounts the outgoing tree before
+ * mounting the incoming one, so a topic shared across routes briefly drops to
+ * zero refs. To avoid connection thrash we coalesce teardown within a tick —
+ * if a new subscriber arrives before the microtask flush, the pending teardown
+ * is cancelled and the existing transport subscription is reused.
+ */
+
+export type TopicHandler<T = unknown> = (event: T) => void;
+
+export interface RegistryEntry {
+  topic: string;
+  count: number;
+}
+
+export interface RegistryChangeEvent {
+  topic: string;
+  count: number;
+  active: boolean;
+}
+
+type ChangeListener = (event: RegistryChangeEvent) => void;
+
+interface TopicState {
+  handlers: Set<TopicHandler>;
+  unsubscribeTransport: (() => void) | null;
+  pendingTeardown: boolean;
+}
+
+/**
+ * Minimal transport surface the registry depends on. Kept structural so tests
+ * can inject a fake transport without importing the real client.
+ */
+export interface RegistryTransport {
+  subscribe(topic: string, onEvent: (event: unknown) => void): () => void;
+}
 
 export interface RealtimeRegistryOptions {
   limits?: RealtimeLimits;
@@ -18,84 +63,142 @@ export interface RealtimeObservabilityEvent {
   breaches?: number;
 }
 
-type Listener = (payload: unknown) => void;
-
-interface SubscriptionEntry {
-  listeners: Set<Listener>;
-}
-
-/**
- * Central registry for realtime topic subscriptions. Limits are enforced here
- * so no consumer can bypass them. Duplicate (refcounted) subscriptions do not
- * count against the topic limit.
- */
-export class RealtimeRegistry {
+export class SubscriptionRegistry {
+  private readonly transport: RegistryTransport;
+  private readonly topics = new Map<string, TopicState>();
+  private readonly listeners = new Set<ChangeListener>();
   private readonly limits: RealtimeLimits;
   private readonly report?: (event: RealtimeObservabilityEvent) => void;
-  private readonly subscriptions = new Map<string, SubscriptionEntry>();
   private readonly rateLimiter: InboundRateLimiter;
 
-  constructor(options: RealtimeRegistryOptions = {}) {
+  constructor(transport: RegistryTransport, options: RealtimeRegistryOptions = {}) {
+    this.transport = transport;
     this.limits = options.limits ?? DEFAULT_REALTIME_LIMITS;
     this.report = options.report;
     this.rateLimiter = new InboundRateLimiter(this.limits);
   }
 
   /**
-   * Subscribe a listener to a topic. Returns an unsubscribe function, or null
-   * when the subscription was refused due to limits (caller should stay on
-   * REST polling).
+   * Subscribe a handler to a topic. Returns an idempotent unsubscribe function.
+   * The first subscriber opens the transport subscription; the last
+   * unsubscribe schedules a coalesced teardown.
    */
-  subscribe(topic: string, listener: Listener): (() => void) | null {
-    const existing = this.subscriptions.get(topic);
-    if (existing) {
-      existing.listeners.add(listener);
-      return () => this.unsubscribe(topic, listener);
+  subscribe<T = unknown>(topic: string, handler: TopicHandler<T>): () => void {
+    let state = this.topics.get(topic);
+    if (!state) {
+      const decision = decideAdmission([...this.topics.keys()], topic, this.limits);
+      if (!decision.admitted) {
+        this.report?.({ type: 'subscription-rejected', topic, reason: decision.reason });
+        // eslint-disable-next-line no-console
+        console.warn(`[realtime] subscription refused for "${topic}": ${decision.reason}`);
+        return () => {};
+      }
+      if (decision.evict) {
+        this.topics.delete(decision.evict);
+      }
+      state = { handlers: new Set(), unsubscribeTransport: null, pendingTeardown: false };
+      this.topics.set(topic, state);
     }
 
-    const decision = decideAdmission([...this.subscriptions.keys()], topic, this.limits);
-    if (!decision.admitted) {
-      this.report?.({ type: 'subscription-rejected', topic, reason: decision.reason });
-      // eslint-disable-next-line no-console
-      console.warn(`[realtime] subscription refused for "${topic}": ${decision.reason}`);
-      return null;
+    // Cancel any pending teardown — a new consumer arrived within the tick.
+    state.pendingTeardown = false;
+
+    const wrapped = handler as TopicHandler;
+    state.handlers.add(wrapped);
+
+    if (!state.unsubscribeTransport) {
+      state.unsubscribeTransport = this.transport.subscribe(topic, (event) => {
+        if (this.rateLimiter.record()) {
+          this.report?.({ type: 'rate-limit-breach', topic, breaches: this.rateLimiter.getBreachCount() });
+          return;
+        }
+        const current = this.topics.get(topic);
+        if (!current) return;
+        for (const h of current.handlers) h(event);
+      });
     }
 
-    if (decision.evict) {
-      this.subscriptions.delete(decision.evict);
-    }
+    this.emit({ topic, count: state.handlers.size, active: true });
 
-    this.subscriptions.set(topic, { listeners: new Set([listener]) });
-    return () => this.unsubscribe(topic, listener);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.release(topic, wrapped);
+    };
   }
 
-  private unsubscribe(topic: string, listener: Listener): void {
-    const entry = this.subscriptions.get(topic);
-    if (!entry) return;
-    entry.listeners.delete(listener);
-    if (entry.listeners.size === 0) {
-      this.subscriptions.delete(topic);
-    }
-  }
+  private release(topic: string, handler: TopicHandler): void {
+    const state = this.topics.get(topic);
+    if (!state) return;
+    state.handlers.delete(handler);
 
-  /** Dispatch an inbound frame to topic listeners, enforcing the rate limit. */
-  dispatch(topic: string, payload: unknown): void {
-    if (this.rateLimiter.record()) {
-      this.report?.({ type: 'rate-limit-breach', topic, breaches: this.rateLimiter.getBreachCount() });
+    if (state.handlers.size > 0) {
+      this.emit({ topic, count: state.handlers.size, active: true });
       return;
     }
-    const entry = this.subscriptions.get(topic);
-    if (!entry) return;
-    for (const listener of entry.listeners) {
-      listener(payload);
+
+    // Last consumer gone: coalesce teardown to the next microtask so a
+    // StrictMode remount or rapid route swap reuses the subscription.
+    state.pendingTeardown = true;
+    this.emit({ topic, count: 0, active: false });
+    queueMicrotask(() => {
+      const current = this.topics.get(topic);
+      if (!current || !current.pendingTeardown) return;
+      current.pendingTeardown = false;
+      current.unsubscribeTransport?.();
+      current.unsubscribeTransport = null;
+      this.topics.delete(topic);
+    });
+  }
+
+  /** Re-establish all active topics after a reconnect. */
+  resubscribeAll(): void {
+    for (const [topic, state] of this.topics) {
+      if (state.handlers.size === 0) continue;
+      state.unsubscribeTransport?.();
+      state.unsubscribeTransport = this.transport.subscribe(topic, (event) => {
+        if (this.rateLimiter.record()) {
+          this.report?.({ type: 'rate-limit-breach', topic, breaches: this.rateLimiter.getBreachCount() });
+          return;
+        }
+        const current = this.topics.get(topic);
+        if (!current) return;
+        for (const h of current.handlers) h(event);
+      });
     }
   }
 
-  getActiveTopics(): string[] {
-    return [...this.subscriptions.keys()];
+  /** Inspectable snapshot of active topics and their consumer counts. */
+  getActiveTopics(): RegistryEntry[] {
+    const entries: RegistryEntry[] = [];
+    for (const [topic, state] of this.topics) {
+      if (state.handlers.size > 0) entries.push({ topic, count: state.handlers.size });
+    }
+    return entries;
+  }
+
+  /** Observe registry-level changes (for the dev inspector / health modules). */
+  onChange(listener: ChangeListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
   getRateBreachCount(): number {
     return this.rateLimiter.getBreachCount();
   }
+
+  private emit(event: RegistryChangeEvent): void {
+    for (const listener of this.listeners) listener(event);
+  }
+}
+
+let defaultRegistry: SubscriptionRegistry | null = null;
+
+/** Lazily bind the shared registry to the typed realtime client. */
+export function getRegistry(client: RealtimeClient): SubscriptionRegistry {
+  if (!defaultRegistry) defaultRegistry = new SubscriptionRegistry(client);
+  return defaultRegistry;
 }
