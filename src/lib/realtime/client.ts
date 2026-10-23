@@ -1,4 +1,5 @@
 import { API_BASE_URL } from "@/lib/api/client";
+import { env } from "@/lib/env";
 import { getRealtimeCapability } from "@/lib/realtime/capabilities";
 
 import { startWakeDetector } from "./lifecycle";
@@ -433,7 +434,7 @@ export class RealtimeClient {
   }
 
   private open(): void {
-    const wsUrl = API_BASE_URL.replace(/^http/, "ws").replace(/\/api\/v1$/, "/ws");
+    const wsUrl = env.NEXT_PUBLIC_REALTIME_URL ?? API_BASE_URL.replace(/^http/, "ws").replace(/\/api\/v1$/, "/ws");
     if (this.status !== "resyncing") this.setStatus("connecting");
     let socket: WebSocket;
     try {
@@ -444,11 +445,11 @@ export class RealtimeClient {
     }
     this.socket = socket;
   }
-  }
 
   private open(): void {
-    const wsUrl = API_BASE_URL.replace(/^http/, "ws").replace(/\/api\/v1$/, "/ws");
+    const wsUrl = env.NEXT_PUBLIC_REALTIME_URL ?? API_BASE_URL.replace(/^http/, "ws").replace(/\/api\/v1$/, "/ws");
     this.updateHealth({ status: this.attempt > 0 ? "reconnecting" : "connecting" });
+
     try {
       this.socket = new WebSocket(wsUrl);
     } catch (err) {
@@ -461,6 +462,24 @@ export class RealtimeClient {
     socket.addEventListener("open", () => {
       if (this.socket !== socket) return;
       this.attempt = 0;
+      this.statusListeners.forEach((cb) => cb(true));
+      this.reportedReconnectLoops = 0;
+      this.updateHealth({ status: "open", attempt: 0 });
+      this.setStatus("live");
+  
+    try {
+      this.socket = new WebSocket(wsUrl);
+    } catch (err) {
+      this.recordError(err);
+      this.scheduleReconnect();
+      return;
+    }
+    const socket = this.socket;
+
+    socket.addEventListener("open", () => {
+      if (this.socket !== socket) return;
+      this.attempt = 0;
+      this.statusListeners.forEach((cb) => cb(true));
       this.reportedReconnectLoops = 0;
       this.updateHealth({ status: "open", attempt: 0 });
       this.setStatus("live");
@@ -521,6 +540,7 @@ export class RealtimeClient {
     this.socket.addEventListener("close", () => {
       this.stopHeartbeat();
       this.socket = null;
+      this.statusListeners.forEach((cb) => cb(false));
       if (!this.closedByUser) {
         this.updateHealth({ status: "reconnecting" });
         this.scheduleReconnect();
@@ -763,6 +783,14 @@ export class RealtimeClient {
 
     return () => {
       this.handlers.get(topic)?.delete(handler);
+    };
+  }
+
+  /** Notifies on socket open/close so consumers can degrade to REST immediately instead of waiting for heartbeat staleness. */
+  onConnectionChange(cb: (connected: boolean) => void): () => void {
+    this.statusListeners.add(cb);
+    return () => {
+      this.statusListeners.delete(cb);
     };
   }
 
