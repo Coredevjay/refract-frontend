@@ -19,6 +19,8 @@ The docs mirror the actual module layout so every path below is verifiable:
 | `src/lib/realtime/capabilities.ts` | Capability negotiation with the backend |
 | `src/lib/realtime/merge.ts` | Merging realtime payloads into cached REST data |
 | `src/lib/realtime/shadow.ts` | Shadow mode: observe realtime without applying it |
+| `src/lib/realtime/contract.ts` | Topics, validators, fixtures, frames |
+| `src/lib/realtime/testing.ts` | Fake transport for tests (never import from production) |
 | `public/flags.json` | Per-topic feature flag defaults |
 
 ## Topic / message contract
@@ -42,6 +44,19 @@ A message has the shape:
 - Messages are applied through `merge.ts`, which reconciles them with the
   cached REST snapshot rather than replacing it wholesale.
 - Unknown `type` values are ignored (forward compatibility).
+
+## Request/response
+
+`realtimeClient.request(topic, payload, { timeoutMs, signal })` multiplexes a
+one-shot query over the open WebSocket.
+
+- Client frame: `{ id, topic, request }`; server replies `{ id, response }` or
+  `{ id, error: { code, message } }`. Frames with an `id` never reach topic
+  subscribers.
+- Rejects with `RealtimeRequestError` (`timeout | aborted | disconnected |
+  overflow | server`). Pending requests reject on disconnect/reconnect and are
+  never replayed; at most 100 may be in flight. Payloads are never logged.
+- SSE/long-poll fallbacks do not support requests; use REST.
 
 ## Connection state machine
 
@@ -99,6 +114,23 @@ true. Shadow mode requires `realtime.enabled` but applies nothing.
 The realtime contract above must be implemented in `refract-backend`. Until
 that lands, treat this document as the spec the backend is built against.
 Changes to the contract require a coordinated change in both repos.
+
+## Testing
+
+Use the fake transport from `@/lib/realtime/testing` (tests only — never import
+it from production code):
+
+```ts
+const fake = installFakeRealtime();
+realtimeClient.subscribe("oracle_update", handler);
+fake.current.open();
+fake.current.emit("oracle_update", { severity: "triggered", value: 9 }); // typed from the contract
+fake.current.drop(); // force close; advance fake timers for reconnect
+afterEach(() => fake.teardown());
+```
+
+`src/lib/realtime/__tests__/topicCoverage.test.ts` fails when a contract topic
+lacks a mock producer, a consumer, or valid fixtures (see its allowlist).
 
 ## Operational runbook
 

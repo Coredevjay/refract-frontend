@@ -44,6 +44,10 @@ const wallet = useStoreSelector(walletStore, (s) => s);
   to avoid hydration mismatches.
 - Review checklist: reject any PR that subscribes to a whole store object.
 
+## Testing realtime hooks
+
+Use the in-memory fake transport (`@/lib/realtime/testing`) instead of hand-rolled WebSocket mocks. See [docs/realtime.md](docs/realtime.md).
+
 ## Realtime conventions
 
 - Subscribe only through `realtimeClient` from `@/lib/realtime`, inside a `useEffect`/`useLayoutEffect`; never `new WebSocket`/`new EventSource` or deep imports like `@/lib/realtime/client` (enforced by ESLint). Escape hatch: `// eslint-disable-next-line <rule> -- <justification>`.
