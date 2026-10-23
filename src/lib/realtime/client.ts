@@ -1,11 +1,31 @@
 import { API_BASE_URL } from "../api/client";
 import { realtimeBus } from "./bus";
 import type { RealtimeTopic, RealtimeTopics } from "./topics";
+import { RequestCorrelator, type RequestOptions } from "./correlation";
 
 type Handler = (payload: unknown) => void;
 type ConnectionListener = (state: ConnectionState) => void;
 
 export type ConnectionState = "idle" | "connected" | "reconnecting";
+
+/** The subset of WebSocket the client relies on; fakes implement the same shape. */
+export interface RealtimeTransport {
+  addEventListener(type: "open" | "message" | "close" | "error", listener: (event: { data?: unknown }) => void): void;
+  send(data: string): void;
+  close(): void;
+}
+
+export type TransportFactory = (url: string) => RealtimeTransport;
+
+const defaultTransportFactory: TransportFactory = (url) => new WebSocket(url) as unknown as RealtimeTransport;
+let transportFactory: TransportFactory = defaultTransportFactory;
+let customTransport = false;
+
+/** Test-only: inject a transport factory. Pass `null` to restore the WebSocket default. */
+export function __setTransportFactory(factory: TransportFactory | null): void {
+  transportFactory = factory ?? defaultTransportFactory;
+  customTransport = factory !== null;
+}
 
 const MAX_BACKOFF_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
@@ -20,10 +40,11 @@ const BASE_BACKOFF_MS = 1_000;
  * truth for initial state.
  */
 class RealtimeClient {
-  private socket: WebSocket | null = null;
+  private socket: RealtimeTransport | null = null;
   private handlers = new Map<string, Set<Handler>>();
   private attempt = 0;
   private closedByUser = false;
+  private correlator = new RequestCorrelator();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private wireTopics = new Set<string>();
   private listeners = new Set<ConnectionListener>();
@@ -68,7 +89,7 @@ class RealtimeClient {
   }
 
   connect(): void {
-    if (typeof WebSocket === "undefined" || this.socket) return;
+    if ((!customTransport && typeof WebSocket === "undefined") || this.socket) return;
     this.closedByUser = false;
     this.open();
   }
@@ -76,7 +97,7 @@ class RealtimeClient {
   private open(): void {
     const wsUrl = API_BASE_URL.replace(/^http/, "ws").replace(/\/api\/v1$/, "/ws");
     try {
-      this.socket = new WebSocket(wsUrl);
+      this.socket = transportFactory(wsUrl);
     } catch {
       this.scheduleReconnect();
       return;
@@ -89,10 +110,9 @@ class RealtimeClient {
     });
     this.socket.addEventListener("message", (event) => {
       try {
-        const { topic, payload } = JSON.parse(event.data as string) as {
-          topic: string;
-          payload: unknown;
-        };
+        const frame = JSON.parse(event.data as string) as { topic: string; payload: unknown };
+        if (this.correlator.handleFrame(frame)) return;
+        const { topic, payload } = frame;
         this.handlers.get(topic)?.forEach((handler) => handler(payload));
         // Decoded events fan out through the bus so consumers never own a socket subscription.
         if (typeof topic === "string" && payload !== null && typeof payload === "object") {
@@ -104,6 +124,7 @@ class RealtimeClient {
     });
     this.socket.addEventListener("close", () => {
       this.socket = null;
+      this.correlator.rejectAll();
       if (!this.closedByUser) {
         this.setState("reconnecting");
         this.scheduleReconnect();
@@ -136,8 +157,30 @@ class RealtimeClient {
     };
   }
 
+  /** One-shot request/response over the open socket; rejects if not connected. */
+  request<T = unknown>(topic: string, payload?: unknown, options?: RequestOptions): Promise<T> {
+    return this.correlator.request<T>(
+      (frame) => {
+        if (!this.socket) throw new Error("Realtime socket is not connected");
+        this.socket.send(frame);
+      },
+      topic,
+      payload,
+      options,
+    );
+  }
+
+  /** Test-only: drop connection, handlers and reconnect state. */
+  __reset(): void {
+    this.disconnect();
+    this.handlers.clear();
+    this.attempt = 0;
+    this.closedByUser = false;
+  }
+
   disconnect(): void {
     this.closedByUser = true;
+    this.correlator.rejectAll();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.socket?.close();
     this.socket = null;
