@@ -1,4 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  clearPersistedSubscriptions,
+  persistSubscriptions,
+  readPersistedSubscriptions,
+  type PersistedSubscription,
+} from '../lib/realtime/persistence';
 import { mergeRealtimeEvent, mergeSnapshot, type MergeFn, type RealtimeEvent, type RealtimeState } from '../lib/realtime/merge';
 import { getRegistry, type SubscriptionRegistry } from '../lib/realtime/registry';
 import type { RealtimeClient } from '../lib/realtime/client';
@@ -34,12 +41,21 @@ export interface UseRealtimeTopicOptions<T> {
   client?: RealtimeClient;
   /** Explicit registry override (tests / inspector). */
   registry?: SubscriptionRegistry;
+  /** Scope used to namespace persisted subscriptions. */
+  scope?: string;
+  /** Wallet used to namespace persisted subscriptions. */
+  wallet?: string;
+  /** Known topics used to validate persisted subscriptions. */
+  knownTopics?: ReadonlySet<string>;
 }
 
 export interface UseRealtimeTopicResult<T> {
   data: T | undefined;
   status: RealtimeStatus;
   lastEventAt: number | null;
+  cursor: string | null;
+  setCursor: (cursor: string | null) => void;
+  clear: () => void;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 30_000;
@@ -86,6 +102,10 @@ const scheduleFrame = (cb: () => void): (() => void) => {
  * storms. A trailing-edge flush guarantees the latest value is always rendered.
  * Coalescing is disabled under reduced motion and in automated tests so
  * flushing is deterministic.
+ *
+ * The last cursor for a topic is persisted to session storage and rehydrated
+ * on mount so reloads and route navigations resume from the snapshot instead
+ * of refetching from scratch.
  */
 export function useRealtimeTopic<T>(
   topic: string,
@@ -103,11 +123,16 @@ export function useRealtimeTopic<T>(
     subscribe,
     client,
     registry,
+    scope = '',
+    wallet = '',
+    knownTopics,
   } = options;
 
   const [data, setData] = useState<T | undefined>(undefined);
   const [status, setStatus] = useState<RealtimeStatus>('idle');
   const [lastEventAt, setLastEventAt] = useState<number | null>(null);
+  const [cursor, setCursorState] = useState<string | null>(null);
+  const hydratedRef = useRef(false);
 
   // Keep the latest merge/fetcher/select in refs so effects don't resubscribe
   // on every render (avoids resubscribe storms).
@@ -193,6 +218,41 @@ export function useRealtimeTopic<T>(
 
   const realtimeActive = enabled && realtimeEnabled && connected && !!subscribeFn;
 
+  // Rehydrate the persisted cursor for this topic on mount.
+  useEffect(() => {
+    if (hydratedRef.current) return;
+    hydratedRef.current = true;
+    const persisted = readPersistedSubscriptions(wallet, scope, knownTopics);
+    const match = persisted.find((entry) => entry.topic === topic);
+    if (match) setCursorState(match.cursor);
+  }, [wallet, scope, topic, knownTopics]);
+
+  const persist = useCallback(
+    (nextCursor: string | null) => {
+      const existing = readPersistedSubscriptions(wallet, scope, knownTopics);
+      const others = existing.filter((entry) => entry.topic !== topic);
+      const next: PersistedSubscription[] = [
+        ...others,
+        { topic, scope, cursor: nextCursor },
+      ];
+      persistSubscriptions(wallet, scope, next);
+    },
+    [wallet, scope, topic, knownTopics],
+  );
+
+  const setCursor = useCallback(
+    (nextCursor: string | null) => {
+      setCursorState(nextCursor);
+      persist(nextCursor);
+    },
+    [persist],
+  );
+
+  const clear = useCallback(() => {
+    setCursorState(null);
+    clearPersistedSubscriptions(wallet, scope);
+  }, [wallet, scope]);
+
   // Snapshot fetch on mount / when the topic changes.
   useEffect(() => {
     mountedRef.current = true;
@@ -234,7 +294,7 @@ export function useRealtimeTopic<T>(
     return () => clearInterval(interval);
   }, [enabled, realtimeActive, pollIntervalMs, fetchSnapshot]);
 
-  return { data, status, lastEventAt };
+  return { data, status, lastEventAt, cursor, setCursor, clear };
 }
 
 /**
