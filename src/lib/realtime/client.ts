@@ -1,6 +1,8 @@
 import { API_BASE_URL } from "@/lib/api/client";
 import { getRealtimeCapability } from "@/lib/realtime/capabilities";
 
+import { recordBytes, utf8Length } from "./metrics";
+
 type Handler = (payload: unknown) => void;
 
 const MAX_BACKOFF_MS = 30_000;
@@ -415,7 +417,8 @@ export class RealtimeClient {
     });
     this.socket.addEventListener("message", (event) => {
       try {
-        const data = JSON.parse(event.data as string) as {
+        const raw = event.data as string;
+        const data = JSON.parse(raw) as {
           topic?: string;
           payload?: unknown;
           type?: string;
@@ -437,6 +440,7 @@ export class RealtimeClient {
           direction: "in",
           payload,
         });
+        recordBytes(topic, "in", utf8Length(raw));
         this.handlers.get(topic)?.forEach((handler) => handler(payload));
         this.markMessageReceived();
       } catch {

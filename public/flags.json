@@ -1,6 +1,7 @@
 {
   "flags": {
     "realtime-oracle": false,
+    "realtime-quotes": false,
     "realtime-heartbeat": true,
     "realtime-heartbeat-interval-ms": 30000,
     "realtime-heartbeat-pong-deadline-ms": 10000,
