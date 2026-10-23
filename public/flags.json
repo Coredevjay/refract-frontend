@@ -1,6 +1,10 @@
 {
   "flags": {
+    "realtime-enabled": false,
     "realtime-oracle": false,
+    "realtime-claims": false,
+    "realtime-pool": false,
+    "realtime-notifications": false,
     "horizon-stream": false,
     "realtime-quotes": false,
     "realtime-heartbeat": true,
