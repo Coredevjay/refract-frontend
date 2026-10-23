@@ -2,6 +2,7 @@ import { API_BASE_URL } from "@/lib/api/client";
 import { env } from "@/lib/env";
 import { getRealtimeCapability } from "@/lib/realtime/capabilities";
 
+import { isTopicEnabled, onTopicFlagChange } from "./flags";
 import { startWakeDetector } from "./lifecycle";
 import { recordBytes, utf8Length } from "./metrics";
 import type { TopicMap } from "./topics";
@@ -187,6 +188,8 @@ export class RealtimeClient {
   private refreshInFlight: Promise<string | null> | null = null;
   private readonly authenticatedSubscriptions = new Map<string, AuthenticatedSubscription>();
   private handlers = new Map<string, Set<Handler>>();
+  /** Handlers for flag-disabled topics: held in memory only, never on the socket. */
+  private parked = new Map<string, Set<Handler>>();
   private transports = new Set<StreamTransport>();
   private statusListeners = new Set<(s: RealtimeStatus) => void>();
   private status: RealtimeStatus = "idle";
@@ -246,6 +249,23 @@ export class RealtimeClient {
   private lastPongAt: number | null = null;
   private consecutiveMisses = 0;
   private healthy = true;
+
+  constructor() {
+    onTopicFlagChange((topic, enabled) => {
+      if (enabled) {
+        const parked = this.parked.get(topic);
+        if (!parked?.size) return;
+        this.parked.delete(topic);
+        parked.forEach((handler) => this.attach(topic, handler));
+      } else {
+        const live = this.handlers.get(topic);
+        if (!live) return;
+        this.handlers.delete(topic);
+        if (live.size) this.parked.set(topic, live);
+        if (this.handlers.size === 0) this.disconnect();
+      }
+    });
+  }
 
   connect(): void {
     if (typeof WebSocket === "undefined" || this.socket) return;
@@ -625,6 +645,34 @@ export class RealtimeClient {
   }
 
   /**
+   * Disabled topics never open a subscription: the handler is parked (so a
+   * mid-session enable can activate it) and callers keep using their REST path.
+   */
+  subscribe(topic: string, handler: Handler): () => void {
+    if (isTopicEnabled(topic)) this.attach(topic, handler);
+    else this.park(topic, handler);
+
+    return () => {
+      this.handlers.get(topic)?.delete(handler);
+      this.parked.get(topic)?.delete(handler);
+    };
+  }
+
+  private park(topic: string, handler: Handler): void {
+    if (!this.parked.has(topic)) this.parked.set(topic, new Set());
+    this.parked.get(topic)!.add(handler);
+  }
+
+  private attach(topic: string, handler: Handler): void {
+    if (!this.handlers.has(topic)) this.handlers.set(topic, new Set());
+    this.handlers.get(topic)!.add(handler);
+    this.connect();
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.sendSubscribe(topic, this.cursors.get(topic));
+    }
+  }
+
+  /**
    * Drops the (possibly dead) connection and reconnects once, immediately,
    * resubscribing every active topic as a single batch with a snapshot
    * request. Idempotent: it supersedes any pending backoff timer instead of
@@ -768,8 +816,44 @@ export class RealtimeClient {
   subscribe<T extends keyof TopicMap>(topic: T, handler: (payload: TopicMap[T]) => void): () => void;
   subscribe(topic: string, handler: Handler): () => void;
   subscribe(topic: string, handler: Handler): () => void {
-    const isNew = !this.handlers.has(topic);
-    if (isNew) this.handlers.set(topic, new Set());
+    if (isTopicEnabled(topic)) this.attach(topic, handler);
+    else this.park(topic, handler);
+
+    return () => {
+      this.handlers.get(topic)?.delete(handler);
+      this.parked.get(topic)?.delete(handler);
+    };
+  }
+
+  private park(topic: string, handler: Handler): void {
+    if (!this.parked.has(topic)) this.parked.set(topic, new Set());
+    this.parked.get(topic)!.add(handler);
+  }
+
+  private attach(topic: string, handler: Handler): void {
+    if (!this.handlers.has(topic)) this.handlers.set(topic, new Set());
+    this.handlers.get(topic)!.add(handler);
+    this.connect();
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.sendSubscribe(topic, this.cursors.get(topic));
+    }
+  }
+
+  private conn
+
+    return () => {
+      this.handlers.get(topic)?.delete(handler);
+      this.parked.get(topic)?.delete(handler);
+    };
+  }
+
+  private park(topic: string, handler: Handler): void {
+    if (!this.parked.has(topic)) this.parked.set(topic, new Set());
+    this.parked.get(topic)!.add(handler);
+  }
+
+  private attach(topic: string, handler: Handler): void {
+    if (!this.handlers.has(topic)) this.handlers.set(topic, new Set());
     this.handlers.get(topic)!.add(handler);
     this.loadCursor(topic);
     this.connect();
@@ -783,6 +867,7 @@ export class RealtimeClient {
 
     return () => {
       this.handlers.get(topic)?.delete(handler);
+      this.parked.get(topic)?.delete(handler);
     };
   }
 
@@ -792,6 +877,20 @@ export class RealtimeClient {
     return () => {
       this.statusListeners.delete(cb);
     };
+  }
+
+  disconnect(): void {
+    this.closedByUser = true;
+    this.stopHeartbeat();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.stopWake?.();
+    this.stopWake = null;
+    this.socket?.close();
+    this.socket = null;
+    this.setStatus("idle");
+  }
+}
   }
 
   disconnect(): void {
